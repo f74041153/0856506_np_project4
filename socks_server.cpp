@@ -18,8 +18,7 @@ class SOCKS4Request
 private:
 	unsigned char _vn;
 	unsigned char _cd;
-	unsigned char _dstport_high;
-	unsigned char _dstport_low;
+	unsigned char _dstport[2];
 	ip::address_v4::bytes_type _dstip;
 	unsigned char _null;
 	boost::array<mutable_buffer, 6> _buffs;
@@ -30,9 +29,7 @@ public:
 		_buffs = {
 			buffer(&_vn,1),
 			buffer(&_cd,1),
-			//buffer(_dstport),
-			buffer(&_dstport_high,1),
-			buffer(&_dstport_low,1),
+			buffer(_dstport),
 			buffer(_dstip),
 			buffer(&_null,1)};
 	}
@@ -44,21 +41,17 @@ public:
 
 	char getcd()
 	{
-		//cout << _vn << endl;
 		return _cd;
 	}
 
 	string getdstport()
 	{
-//		cout <<"get: " <<to_string(_dstport_high) << " " << to_string(_dstport_low) <<endl;
-//		cout << to_string(((_dstport_high*256) + _dstport_low))<< endl;
-//		return to_string(((_dstport_high*256) + _dstport_low));
-		return to_string(((_dstport_high<<8) & 0xff00) | _dstport_low);
+		return to_string(((_dstport[0]<<8) & 0xff00) | _dstport[1]);
 	}
 
 	string getdstip()
 	{
-		ip::address_v4 addr(_dstip);
+		ip::address_v4 addr(_dstip);	
 		return addr.to_string();
 	}
 };
