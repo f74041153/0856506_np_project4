@@ -62,16 +62,14 @@ private:
 	unsigned char _vn;
 	unsigned char _cd;
 	unsigned char _dstport[2];
-	char _dstip[4];
+	ip::address_v4::bytes_type _dstip;
 	boost::array<mutable_buffer, 4> _buffs;
 
 public:
-	SOCKS4Reply(string dstport, string dstip, unsigned char cd) : _vn(0x00), _cd(cd){
-		//cout << _vn << endl;
-		//cout << _cd << endl;
+	SOCKS4Reply(string dstip, string dstport, unsigned char cd) : _vn(0x00), _cd(cd){
 		_dstport[0] = (stoi(dstport)>>8) & 0xff;
 		_dstport[1] = stoi(dstport) & 0xff;
-		strcpy(_dstip,dstip.c_str());
+		_dstip = ip::address_v4::from_string(dstip).to_bytes();
 	}
 
 	boost::array<mutable_buffer, 4> getbuffs()
@@ -92,6 +90,7 @@ private:
 	{
 		max_length = 1024
 	};
+	ip::tcp::acceptor bind_acceptor{global_io_service};
 	ip::tcp::resolver resolv{global_io_service};
 	ip::tcp::socket tcp_socket{global_io_service};
 	ip::tcp::socket _socket;
@@ -113,14 +112,26 @@ private:
 			[this, self](boost::system::error_code ec, size_t length) {
 				
 				char cd = SOCKS4req.getcd();
-
 				if (cd == 0x01)
 				{
+					cout << "connect" << endl;
 					string dstip = SOCKS4req.getdstip();
 					string dstport = SOCKS4req.getdstport();
 					ip::tcp::resolver::query q(dstip, dstport);
-					cout << dstip << endl << dstport << endl;
 					do_resolve(dstip,dstport,q);
+				}else if (cd == 0x02){
+					cout << "bind" << endl;
+					unsigned short port(0);
+					ip::tcp::endpoint bind_endpoint(ip::tcp::endpoint(ip::tcp::v4(), port));
+					bind_acceptor.open(bind_endpoint.protocol());
+					bind_acceptor.set_option(ip::tcp::acceptor::reuse_address(true));
+					bind_acceptor.bind(bind_endpoint);
+					bind_acceptor.listen();
+					
+					string dstip = bind_acceptor.local_endpoint().address().to_string();
+					string dstport = to_string(bind_acceptor.local_endpoint().port());		
+					SOCKS4Reply reply(dstip,dstport,0x5a);
+					send_socks4_reply(reply,2);	
 				}else{
 					_socket.close();
 				}
@@ -144,24 +155,40 @@ private:
 			if (!ec)
 			{
 				SOCKS4Reply reply(dstip,dstport,0x5a);
-				send_socks4_reply(reply);
+				send_socks4_reply(reply,1);
 			}
 		});
 	}
 
-	void send_socks4_reply(SOCKS4Reply reply)
+	void do_accept(SOCKS4Reply reply)
+	{
+		bind_acceptor.async_accept(_socket, [this,reply](boost::system::error_code ec) {			
+				if (!ec){
+					send_socks4_reply(reply,1);
+				}else{
+					_socket.close();
+				}
+		});
+	}
+
+	void send_socks4_reply(SOCKS4Reply reply,int act)
 	{
 		auto self(shared_from_this());
 		_socket.async_send(
 			reply.getbuffs(),
-			[this, self](boost::system::error_code ec, size_t /* length */) {
-				if (!ec)
-					relay();
+			[this, self,act,reply](boost::system::error_code ec, size_t /* length */) {
+				if (!ec){
+					if(act == 1)
+						relay();
+					else
+						do_accept(reply);
+				}
 			});
 	}
 
 	void relay()
 	{
+		cout << "ralay"<<endl;
 		client_relay();
 		host_relay();
 	}
@@ -175,7 +202,11 @@ private:
 				if (!ec)
 				{
 					string data(_data1.data(), length);
+					cout << data << endl;
 					send_client_relay(data);
+				}else{
+					_socket.close();
+					tcp_socket.close();
 				}
 			});
 	}
@@ -189,9 +220,10 @@ private:
 				if (!ec)
 				{
 					cout << "send client relay" << endl;
-				//	string data(_data1.data(), len);
-				//	cout << data << endl;
 					client_relay();
+				}else{
+					_socket.close();
+					tcp_socket.close();
 				}
 			});
 	}
@@ -206,6 +238,9 @@ private:
 				{
 					string data(_data2.data(), length);
 					send_host_relay(data);
+				}else{
+					_socket.close();
+					tcp_socket.close();
 				}
 			});
 	}
@@ -220,7 +255,11 @@ private:
 				{
 					cout << "send host relay" << endl;
 					host_relay();
+				}else{
+					_socket.close();
+					tcp_socket.close();
 				}
+
 			});
 	}
 };

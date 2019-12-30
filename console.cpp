@@ -1,5 +1,6 @@
 #include <array>
 #include <boost/asio.hpp>
+#include <boost/array.hpp>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -19,50 +20,126 @@ struct RemoteServer
 	int id;
 };
 
+struct SServer{
+	string host;
+	string port;
+};
+
 io_service global_io_service;
+
+class SOCKS4Request
+{
+private:
+	unsigned char _vn;
+	unsigned char _cd;
+	unsigned char _dstport[2];
+	ip::address_v4::bytes_type _dstip;
+	unsigned char _null;
+	boost::array<mutable_buffer, 6> _buffs;
+
+public:
+	SOCKS4Request(string dstip, string dstport, unsigned char cd): _vn(0x04), _cd(cd), _null(0x00)
+	{
+		_dstport[0] = (stoi(dstport)>>8) & 0xff;
+		_dstport[1] = stoi(dstport) & 0xff;
+		_dstip = ip::address_v4::from_string(dstip).to_bytes();
+	}
+
+	boost::array<mutable_buffer, 6> getbuffs()
+	{
+		
+		_buffs = {
+			buffer(&_vn,1),
+			buffer(&_cd,1),
+			buffer(_dstport),
+			buffer(_dstip),
+			buffer(&_null,1)};
+		return _buffs;
+	}
+
+	char getcd()
+	{
+		return _cd;
+	}
+
+	string getdstport()
+	{
+		return to_string(((_dstport[0]<<8) & 0xff00) | _dstport[1]);
+	}
+
+	string getdstip()
+	{
+		ip::address_v4 addr(_dstip);	
+		return addr.to_string();
+	}
+};
+
+class SOCKS4Reply
+{
+private:
+	unsigned char _vn;
+	unsigned char _cd;
+	unsigned char _dstport[2];
+	ip::address_v4::bytes_type _dstip;
+	boost::array<mutable_buffer, 4> _buffs;
+
+public:
+	SOCKS4Reply(){}
+
+	boost::array<mutable_buffer, 4> getbuffs()
+	{
+		_buffs = {buffer(&_vn,1),
+				  buffer(&_cd,1),
+				  buffer(_dstport),
+				  buffer(_dstip)};
+		return _buffs;
+	}
+
+	char getcd()
+	{
+		return _cd;
+	}
+
+};
 
 class ConsoleSession : public enable_shared_from_this<ConsoleSession>
 {
 private:
 	enum
 	{
+		normal = 0,
+		socks4 = 1, 
 		max_length = 4096
 	};
-	ip::tcp::resolver::query q;
 	ip::tcp::resolver resolv{global_io_service};
 	ip::tcp::socket tcp_socket{global_io_service};
 	array<char, max_length> _data;
+	struct SServer sserver;
 	struct RemoteServer RS;
 	ifstream testcase;
-	deadline_timer timer;
+	int mode;
+	SOCKS4Reply socks4_reply;
 
 public:
-	ConsoleSession(struct RemoteServer rs) : q(rs.host, rs.port), RS(rs), testcase("test_case/" + rs.file),timer(global_io_service) {
-		//timer_routine();
-	}
+	ConsoleSession(struct SServer sserv, struct RemoteServer rs) : sserver(sserv), RS(rs), testcase("test_case/" + rs.file){}
 
 	void start()
 	{
-		do_resolve();
+		if(sserver_selected(sserver))
+		{
+			mode = socks4;
+			ip::tcp::resolver::query q(sserver.host,sserver.port);
+			do_resolve(q);
+		}else
+		{
+			mode = normal;
+			ip::tcp::resolver::query q(RS.host,RS.port);
+			do_resolve(q);
+		}
 	}
 
 private:
-	void timer_routine(int sec)
-	{
-		auto self(shared_from_this());
-		timer.expires_from_now(boost::posix_time::seconds(sec));
-		timer.async_wait([this,self](boost::system::error_code ec){
-       			if(!ec){
-				string content = "Hello";
-				string rsp = "<script>document.getElementById('s" + to_string(RS.id) + "').innerHTML += \'" + content + "\';</script>";
-				write(1, rsp.c_str(), rsp.size());
-				timer_routine(2);
-			}               
-	        }); 
-	}
-
-
-	void do_resolve()
+	void do_resolve(ip::tcp::resolver::query q)
 	{
 		auto self(shared_from_this());
 		resolv.async_resolve(q, [this, self](boost::system::error_code ec, ip::tcp::resolver::iterator it) {
@@ -74,12 +151,52 @@ private:
 	{
 		auto self(shared_from_this());
 		tcp_socket.async_connect(*it, [this, self](boost::system::error_code ec) {
-			if (!ec){
-				timer_routine(0);
-				do_read();
+			if (!ec){		
+				if(mode == normal){
+					do_read();
+				}else if(mode == socks4){
+					ip::tcp::resolver resolver(global_io_service);
+					ip::tcp::resolver::query query(RS.host,RS.port);
+					ip::tcp::endpoint endpoint = *resolver.resolve(query);
+					string dstip = endpoint.address().to_string();
+					string dstport = to_string(endpoint.port());
+					do_socks4_request(dstip,dstport);
+				}
+			}else{
+				tcp_socket.close();
 			}
 		});
 	}
+
+	void do_socks4_request(string dstip, string dstport){
+		SOCKS4Request socks4_req(dstip,dstport,0x01);
+		auto self(shared_from_this());
+		tcp_socket.async_send(
+			socks4_req.getbuffs(),
+			[this, self](boost::system::error_code ec, size_t /* length */) {
+				if (!ec)
+					wait_socks4_reply();
+			});
+
+	}
+	
+	void wait_socks4_reply(){
+		auto self(shared_from_this());
+		tcp_socket.async_read_some(
+			socks4_reply.getbuffs(),
+			[this, self](boost::system::error_code ec, size_t length) {
+				if (!ec){
+					char cd = socks4_reply.getcd();
+					if(cd == 0x5a){
+						// request grant
+						do_read();
+					}else{
+						tcp_socket.close();
+					}
+				}
+			});
+	}
+
 	void do_read()
 	{
 		auto self(shared_from_this());
@@ -119,6 +236,13 @@ private:
 				if (!ec)
 					do_read();
 			});
+	}
+
+	bool sserver_selected(struct SServer sserver)
+	{
+		if(sserver.host.size() && sserver.port.size())
+			return true;
+		return false;
 	}
 
 	bool percent_exist(string str)
@@ -185,7 +309,7 @@ private:
 	}
 };
 
-void set_remote_server(struct RemoteServer rs[])
+void set_remote_server(struct SServer& sserver, struct RemoteServer rs[])
 {
 	string q_str = getenv("QUERY_STRING");
 	stringstream ss1(q_str);
@@ -200,6 +324,10 @@ void set_remote_server(struct RemoteServer rs[])
 		rs[i].file = str.substr(3, str.size() - 1);
 		rs[i].id = i;
 	}
+	getline(ss1, str, '&');
+	sserver.host = str.substr(3, str.size() - 1);
+	getline(ss1, str, '&');
+	sserver.port = str.substr(3, str.size() - 1);
 }
 
 bool rs_selected(struct RemoteServer rs)
@@ -283,19 +411,22 @@ void first_page(struct RemoteServer rs[])
 	write(1, rsp.c_str(), rsp.size());
 }
 
+
+
 int main(int argc, char *const argv[])
 {
 
 	try
 	{
 		struct RemoteServer RS[MAXHOST];
-		set_remote_server(RS);
+		struct SServer sserver;
+		set_remote_server(sserver,RS);
 		first_page(RS);
 		for (int i = 0; i < MAXHOST; i++)
 		{
 			if (rs_selected(RS[i]))
 			{
-				make_shared<ConsoleSession>(RS[i])->start();
+				make_shared<ConsoleSession>(sserver,RS[i])->start();
 			}
 		}
 		global_io_service.run();
