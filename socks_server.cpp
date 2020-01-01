@@ -7,6 +7,8 @@
 #include <utility>
 #include <sstream>
 #include <string>
+#include <fstream>
+#include <cstring>
 
 using namespace std;
 using namespace boost::asio;
@@ -39,9 +41,27 @@ public:
 		return _buffs;
 	}
 
+	void setbuffs(string buf)
+	{
+		_vn = buf[0];
+		_cd = buf[1];
+		_dstport[0] = buf[2];
+		_dstport[1] = buf[3];
+		_dstip[0] = buf[4];
+		_dstip[1] = buf[5];
+		_dstip[2] = buf[6];
+		_dstip[3] = buf[7];
+		_null = 0x00;
+	}
+
 	char getcd()
 	{
 		return _cd;
+	}
+	
+	char getvn()
+	{
+		return _vn;
 	}
 
 	string getdstport()
@@ -88,7 +108,7 @@ class SOCKS4Session : public enable_shared_from_this<SOCKS4Session>
 private:
 	enum
 	{
-		max_length = 1024
+		max_length = 4096
 	};
 	ip::tcp::acceptor bind_acceptor{global_io_service};
 	ip::tcp::resolver resolv{global_io_service};
@@ -97,6 +117,7 @@ private:
 	SOCKS4Request SOCKS4req;
 	array<char, max_length> _data1;
 	array<char, max_length> _data2;
+	array<char, max_length> _socks4_reqbuf;
 
 public:
 	SOCKS4Session(ip::tcp::socket socket) : _socket(move(socket)) {}
@@ -108,32 +129,52 @@ private:
 	{
 		auto self(shared_from_this());
 		_socket.async_read_some(
-			SOCKS4req.getbuffs(),
+			buffer(_socks4_reqbuf),
 			[this, self](boost::system::error_code ec, size_t length) {
-				
-				char cd = SOCKS4req.getcd();
-				if (cd == 0x01)
-				{
-					cout << "connect" << endl;
+				string buf(_socks4_reqbuf.data(),length);
+				SOCKS4req.setbuffs(buf);
+				char vn = SOCKS4req.getvn();
+				if(vn != 0x04)
+					_socket.close();
+				else{
 					string dstip = SOCKS4req.getdstip();
 					string dstport = SOCKS4req.getdstport();
-					ip::tcp::resolver::query q(dstip, dstport);
-					do_resolve(dstip,dstport,q);
-				}else if (cd == 0x02){
-					cout << "bind" << endl;
-					unsigned short port(0);
-					ip::tcp::endpoint bind_endpoint(ip::tcp::endpoint(ip::tcp::v4(), port));
-					bind_acceptor.open(bind_endpoint.protocol());
-					bind_acceptor.set_option(ip::tcp::acceptor::reuse_address(true));
-					bind_acceptor.bind(bind_endpoint);
-					bind_acceptor.listen();
-					
-					string dstip = bind_acceptor.local_endpoint().address().to_string();
-					string dstport = to_string(bind_acceptor.local_endpoint().port());		
-					SOCKS4Reply reply(dstip,dstport,0x5a);
-					send_socks4_reply(reply,2);	
-				}else{
-					_socket.close();
+					string srcip = _socket.remote_endpoint().address().to_string();
+					string srcport = to_string(_socket.remote_endpoint().port()); 
+					char cd = SOCKS4req.getcd();
+					if(!firewall(cd,dstip)){
+						string cmd = (cd == 0x01)? "CONNECT" : "BIND";
+						string reply = "Reject";
+						print_server_msg(srcip,srcport,dstip,dstport,cmd,reply);
+						SOCKS4Reply s4reply(dstip,dstport,0x5b);
+						send_socks4_reply(s4reply,3);	
+					}else{
+						if (cd == 0x01)
+						{
+							string cmd = "CONNECT";
+							string reply = "Accept";
+							print_server_msg(srcip,srcport,dstip,dstport,cmd,reply);
+							ip::tcp::resolver::query q(dstip, dstport);
+							do_resolve(dstip,dstport,q);
+						}else if (cd == 0x02){
+							string cmd = "BIND";
+							string reply = "Accept";
+							print_server_msg(srcip,srcport,dstip,dstport,cmd,reply);
+							unsigned short port(0);
+							ip::tcp::endpoint bind_endpoint(ip::tcp::endpoint(ip::tcp::v4(), port));
+							bind_acceptor.open(bind_endpoint.protocol());
+							bind_acceptor.set_option(ip::tcp::acceptor::reuse_address(true));
+							bind_acceptor.bind(bind_endpoint);
+							bind_acceptor.listen();
+							
+							string bind_ip = bind_acceptor.local_endpoint().address().to_string();
+							string bind_port = to_string(bind_acceptor.local_endpoint().port());		
+							SOCKS4Reply s4reply(bind_ip,bind_port,0x5a);
+							send_socks4_reply(s4reply,2);	
+						}else{
+							_socket.close();
+						}
+					}
 				}
 			});
 	}
@@ -145,6 +186,9 @@ private:
 			[this, self, dstip, dstport](boost::system::error_code ec, ip::tcp::resolver::iterator it) {
 				if (!ec)
 					do_connect(it, dstip, dstport);
+				else{
+					_socket.close();
+				}
 			});
 	}
 
@@ -156,17 +200,22 @@ private:
 			{
 				SOCKS4Reply reply(dstip,dstport,0x5a);
 				send_socks4_reply(reply,1);
+			}else{
+				_socket.close();
+				tcp_socket.close();	
 			}
 		});
 	}
 
 	void do_accept(SOCKS4Reply reply)
 	{
-		bind_acceptor.async_accept(_socket, [this,reply](boost::system::error_code ec) {			
+		auto self(shared_from_this());
+		bind_acceptor.async_accept(tcp_socket, [this,self,reply](boost::system::error_code ec) {			
 				if (!ec){
 					send_socks4_reply(reply,1);
 				}else{
 					_socket.close();
+					tcp_socket.close();	
 				}
 		});
 	}
@@ -178,19 +227,25 @@ private:
 			reply.getbuffs(),
 			[this, self,act,reply](boost::system::error_code ec, size_t /* length */) {
 				if (!ec){
+					//cout << "send_socks4_reply" << endl;
 					if(act == 1)
 						relay();
-					else
+					else if(act ==2)
 						do_accept(reply);
+					else
+						_socket.close();
+				}else{
+					_socket.close();
+					if(act == 1)
+						tcp_socket.close();
 				}
 			});
 	}
 
 	void relay()
 	{
-		cout << "ralay"<<endl;
-		client_relay();
 		host_relay();
+		client_relay();
 	}
 
 	void client_relay()
@@ -202,8 +257,7 @@ private:
 				if (!ec)
 				{
 					string data(_data1.data(), length);
-					cout << data << endl;
-					send_client_relay(data);
+					send_client_relay(data,length);
 				}else{
 					_socket.close();
 					tcp_socket.close();
@@ -211,15 +265,16 @@ private:
 			});
 	}
 
-	void send_client_relay(string data)
+	void send_client_relay(string data,size_t len)
 	{
 		auto self(shared_from_this());
-		tcp_socket.async_send(
-			buffer(data),
-			[this, self](boost::system::error_code ec, size_t length) {
+		async_write(tcp_socket,
+			buffer(_data1,len),
+			[this, self,data](boost::system::error_code ec, size_t length) {
 				if (!ec)
 				{
-					cout << "send client relay" << endl;
+					//cout << "send client relay" << endl;
+					//cout << data << endl;
 					client_relay();
 				}else{
 					_socket.close();
@@ -237,7 +292,7 @@ private:
 				if (!ec)
 				{
 					string data(_data2.data(), length);
-					send_host_relay(data);
+					send_host_relay(data,length);
 				}else{
 					_socket.close();
 					tcp_socket.close();
@@ -245,22 +300,59 @@ private:
 			});
 	}
 
-	void send_host_relay(string data)
+	void send_host_relay(string data,size_t len)
 	{
 		auto self(shared_from_this());
-		_socket.async_send(
-			buffer(data),
-			[this, self](boost::system::error_code ec, size_t length) {
+		async_write(_socket,
+			buffer(_data2,len),
+			[this, self,data](boost::system::error_code ec, size_t length) {
 				if (!ec)
 				{
-					cout << "send host relay" << endl;
+					//cout << "send host relay" << endl;
+					//cout << data << endl;
 					host_relay();
 				}else{
 					_socket.close();
 					tcp_socket.close();
 				}
-
 			});
+	}
+
+	bool firewall(char cd, string ip){
+		ifstream ifs("socks.conf");
+		string rule;
+		char mode = (cd==0x01)?'c':'b';
+		while(getline(ifs,rule)){
+			if(rule[7] == mode){
+				string _ip = rule.substr(9,rule.size()-1),str1,str2;
+				if(!strcmp(_ip.c_str(),ip.c_str())){
+					ifs.close();
+					return true;
+				}
+				stringstream ss1(_ip),ss2(ip);
+				while(getline(ss1,str1,'.')){
+					getline(ss2,str2,'.');
+					if(!strcmp(str1.c_str(),"*")){
+						ifs.close();
+						return true;
+					}						
+					if(strcmp(str1.c_str(),str2.c_str()))
+						break;
+				}
+			}
+		}
+		ifs.close();
+		return false;
+	}
+
+	void print_server_msg(string srcip,string srcport,string dstip,string dstport,string cmd,string reply){
+		cout << "<S_IP>: " << srcip << endl; 
+		cout << "<S_PORT>: " << srcport << endl; 
+		cout << "<D_IP>: " << dstip << endl; 
+		cout << "<D_PORT>: " << dstport << endl;
+		cout << "<COMMAND>: " << cmd << endl;
+		cout << "<Reply>: " << reply << endl;
+		cout << "======================================" << endl;
 	}
 };
 
