@@ -341,30 +341,37 @@ private:
 	bool firewall(char cd, string ip)
 	{
 		ifstream ifs("socks.conf");
-		string rule;
-		char mode = (cd == 0x01) ? 'c' : 'b';
+		string rule, str, _ip, _mode;
+		string mode = (cd == 0x01) ? "c" : "b";
 		while (getline(ifs, rule))
 		{
-			if (rule[7] == mode)
+			stringstream ss1(rule);
+			getline(ss1, str, '#');
+			stringstream ss2(str);
+			getline(ss2, str, ' ');
+			getline(ss2, _mode, ' ');
+			getline(ss2, _ip, ' ');
+
+			if(strcmp(mode.c_str(),_mode.c_str()))
+				continue;
+
+			if (!strcmp(_ip.c_str(), ip.c_str()))
 			{
-				string _ip = rule.substr(9, rule.size() - 1), str1, str2;
-				if (!strcmp(_ip.c_str(), ip.c_str()))
+				ifs.close();
+				return true;
+			}
+			stringstream ss3(_ip), ss4(ip);
+			string str1, str2;
+			while (getline(ss3, str1, '.'))
+			{
+				getline(ss4, str2, '.');
+				if (!strcmp(str1.c_str(), "*"))
 				{
 					ifs.close();
 					return true;
 				}
-				stringstream ss1(_ip), ss2(ip);
-				while (getline(ss1, str1, '.'))
-				{
-					getline(ss2, str2, '.');
-					if (!strcmp(str1.c_str(), "*"))
-					{
-						ifs.close();
-						return true;
-					}
-					if (strcmp(str1.c_str(), str2.c_str()))
-						break;
-				}
+				if (strcmp(str1.c_str(), str2.c_str()))
+					break;
 			}
 		}
 		ifs.close();
