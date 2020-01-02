@@ -36,21 +36,32 @@ public:
 			buffer(&_null, 1)};
 	}
 
-	boost::array<mutable_buffer, 6> getbuffs()
-	{
-		return _buffs;
-	}
-
 	void setbuffs(string buf)
 	{
 		_vn = buf[0];
 		_cd = buf[1];
 		_dstport[0] = buf[2];
 		_dstport[1] = buf[3];
-		_dstip[0] = buf[4];
-		_dstip[1] = buf[5];
-		_dstip[2] = buf[6];
-		_dstip[3] = buf[7];
+		if(buf[4] == 0x00 && buf[5] == 0x00 && buf[6] == 0x00)
+		{
+			string remain = buf.substr(8);
+			int idx = remain.find('\0')+1;
+			int len = remain.size()-idx;
+			string hostname = remain.substr(idx,len);
+		
+			ip::tcp::resolver resolver(global_io_service);
+			ip::tcp::resolver::query query(hostname,getdstport());
+			ip::tcp::endpoint endpoint = *resolver.resolve(query);
+			string dstip = endpoint.address().to_string();
+			_dstip = ip::address_v4::from_string(dstip).to_bytes();
+		}
+		else
+		{
+			_dstip[0] = buf[4];
+			_dstip[1] = buf[5];
+			_dstip[2] = buf[6];
+			_dstip[3] = buf[7];
+		}		
 		_null = 0x00;
 	}
 
@@ -132,12 +143,12 @@ private:
 			buffer(_socks4_reqbuf),
 			[this, self](boost::system::error_code ec, size_t length) {
 				string buf(_socks4_reqbuf.data(), length);
-				SOCKS4req.setbuffs(buf);
-				char vn = SOCKS4req.getvn();
+				char vn = buf[0];
 				if (vn != 0x04)
 					_socket.close();
 				else
 				{
+					SOCKS4req.setbuffs(buf);
 					string dstip = SOCKS4req.getdstip();
 					string dstport = SOCKS4req.getdstport();
 					string srcip = _socket.remote_endpoint().address().to_string();
